@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Firefly Habitat Zoning — GIS + Random Forest (HTML/JS)</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- PapaParse for CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <!-- Turf.js for light geoprocessing (buffer, bbox grid, etc.) -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <!-- Random Forest (ml.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/ml-random-forest@4.1.1/dist/ml-random-forest.min.js"></script>
+
+  <!-- Simple styles -->
+  <style>
+    :root{
+      --bg:#0b0f14; --panel:#121821; --accent:#3fb3ff; --text:#e7eef8; --muted:#90a4b8;
+      --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --border:#1f2733;
+    }
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .layout{display:grid;grid-template-columns:340px 1fr;grid-template-rows:56px 1fr;gap:0;height:100%}
+    header{grid-column:1/3;display:flex;align-items:center;justify-content:space-between;padding:0 16px;background:#0d141c;border-bottom:1px solid var(--border)}
+    header h1{font-size:16px;margin:0;font-weight:600}
+    header .mini{opacity:.8;font-size:12px}
+    aside{border-right:1px solid var(--border);background:var(--panel);overflow:auto}
+    main{position:relative}
+    #map{position:absolute;inset:0}
+    .panel{padding:14px 14px 80px}
+    .group{border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:12px;background:#0f1722}
+    .group h3{margin:0 0 8px;font-size:14px}
+    label{font-size:12px;color:var(--muted);display:block;margin:6px 0 4px}
+    input[type="text"],select{width:100%;background:#0b1220;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px}
+    input[type="file"]{width:100%}
+    button{background:var(--accent);border:none;color:#00131f;padding:10px 12px;border-radius:10px;font-weight:700;cursor:pointer}
+    button.secondary{background:#1c2635;color:var(--text);border:1px solid var(--border)}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .pill{display:inline-flex;gap:6px;align-items:center;padding:4px 8px;border-radius:999px;border:1px solid var(--border);background:#0c1522;color:var(--muted);font-size:11px}
+    .legend{position:absolute;bottom:12px;left:12px;background:#0c1420;border:1px solid var(--border);border-radius:10px;padding:10px;color:#cfe7ff;font-size:12px}
+    .legend .bar{height:10px;background:linear-gradient(90deg,#1b4,#2a5,#4c7,#8ba,#c9c,#f77);border-radius:6px;margin:6px 0}
+    .metrics{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px;}
+    .foot{position:sticky;bottom:0;background:#0d141c;border-top:1px solid var(--border);padding:10px;display:flex;gap:8px;flex-wrap:wrap}
+    .hint{font-size:11px;color:#a8c3da}
+    a{color:#7ed0ff}
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header>
+      <h1>Firefly Habitat Zoning <span class="mini">— GIS + Random Forest (Browser‑only)</span></h1>
+      <div class="pill">Status: <span id="status">idle</span></div>
+    </header>
+    <aside>
+      <div class="panel">
+        <div class="group">
+          <h3>1) Upload Training CSV (points + features)</h3>
+          <p class="hint">CSV required columns: <b>lon</b>, <b>lat</b>, one or more feature columns (e.g., <i>ndvi, salinity, canopy, dist_water</i>), and a <b>label</b> column (0/1 presence).</p>
+          <input id="trainFile" type="file" accept=".csv,.txt"/>
+          <label for="labelCol">Label column</label>
+          <input id="labelCol" type="text" placeholder="e.g. presence"/>
+          <label for="featureCols">Feature columns (comma‑separated)</label>
+          <input id="featureCols" type="text" placeholder="e.g. ndvi,canopy,dist_water,salinity"/>
+          <div class="row" style="margin-top:8px">
+            <button id="btnPreview">Preview</button>
+            <button id="btnTrain">Train RF</button>
+          </div>
+          <div id="previewBox" class="metrics" style="margin-top:8px"></div>
+        </div>
+
+        <div class="group">
+          <h3>2) Upload Prediction GeoJSON (grid/points + same features)</h3>
+          <p class="hint">Provide polygons (grid) or points that already carry the same feature columns you trained on.</p>
+          <input id="predictFile" type="file" accept=".geojson,.json"/>
+          <label for="predIdCol">ID/Name property (optional)</label>
+          <input id="predIdCol" type="text" placeholder="e.g. cell_id"/>
+          <div class="row" style="margin-top:8px">
+            <button id="btnPredict" class="secondary">Run Prediction</button>
+            <button id="btnExport" class="secondary">Export GeoJSON</button>
+          </div>
+          <div id="predictStats" class="metrics" style="margin-top:8px"></div>
+        </div>
+
+        <div class="group">
+          <h3>3) Styling</h3>
+          <label for="paletteSel">Palette</label>
+          <select id="paletteSel">
+            <option value="viridis">Viridis‑like</option>
+            <option value="red">Red scale</option>
+            <option value="blue">Blue scale</option>
+            <option value="green">Green scale</option>
+          </select>
+          <label for="threshold">Suitability threshold (0–1)</label>
+          <input id="threshold" type="text" value="0.5"/>
+          <div style="margin-top:8px">
+            <button id="btnRecolor" class="secondary">Recolor Layer</button>
+          </div>
+        </div>
+
+        <div class="group">
+          <h3>Notes & Tips</h3>
+          <ul class="hint">
+            <li>Start with 200–2000 labeled training samples (presence=1 / absence=0).</li>
+            <li>Feature engineering ideas: NDVI/NDWI, canopy density, distance to water/settlement/light sources, elevation/slope, salinity, tidal range.</li>
+            <li>Precompute features in QGIS/Google Earth Engine, then bring them here.</li>
+          </ul>
+        </div>
+
+        <div class="foot">
+          <span class="pill">RF trees: <span id="rfTrees">100</span></span>
+          <span class="pill">Max depth: <span id="rfDepth">10</span></span>
+          <button id="btnParams" class="secondary">Tune Params</button>
+          <button id="btnClear" class="secondary">Clear Map</button>
+        </div>
+      </div>
+    </aside>
+
+    <main>
+      <div id="map"></div>
+      <div class="legend" id="legend" style="min-width:220px">
+        <div><b>Predicted Suitability</b> (0 → 1)</div>
+        <div class="bar"></div>
+        <div class="metrics" id="metricBox">—</div>
+      </div>
+    </main>
+  </div>
+
+<script>
+(function(){
+  // ====== Map init ======
+  const map = L.map('map', { zoomControl: true }).setView([-2.0, 111.0], 5);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  const layers = {
+    training: L.layerGroup().addTo(map),
+    prediction: L.layerGroup().addTo(map)
+  };
+
+  // ====== State ======
+  const state = {
+    trainRows: [],
+    featureCols: [],
+    labelCol: 'presence',
+    forest: null,
+    rfParams: { nEstimators: 100, maxDepth: 10, seed: 42 },
+    predictGeoJSON: null,
+    predictResult: null
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status');
+  function setStatus(s){ statusEl.textContent = s; }
+
+  // ====== Helpers ======
+  function csvToMarkers(rows){
+    layers.training.clearLayers();
+    rows.slice(0, 10000).forEach(r => {
+      const lat = parseFloat(r.lat), lon = parseFloat(r.lon);
+      if(Number.isFinite(lat) && Number.isFinite(lon)){
+        const c = r[state.labelCol] == 1 || r[state.labelCol] === '1' ? '#22c55e' : '#ef4444';
+        L.circleMarker([lat, lon], { radius: 4, color: c, weight: 1, fillOpacity: 0.8 }).addTo(layers.training);
+      }
+    });
+    try{ map.fitBounds(layers.training.getBounds(), { padding:[12,12] }); }catch(e){}
+  }
+
+  function parseCSV(file){
+    return new Promise((resolve,reject)=>{
+      Papa.parse(file, {
+        header: true,
+        dynamicTyping: true,
+        skipEmptyLines: true,
+        complete: (res)=> resolve(res.data),
+        error: reject
+      });
+    });
+  }
+
+  function holdoutSplit(rows, labelCol, testRatio=0.2){
+    const pos = rows.filter(r => Number(r[labelCol]) === 1);
+    const neg = rows.filter(r => Number(r[labelCol]) === 0);
+    function split(arr){
+      const nTest = Math.max(1, Math.floor(arr.length * testRatio));
+      const shuffled = arr.slice().sort(()=> Math.random()-0.5);
+      return { train: shuffled.slice(nTest), test: shuffled.slice(0, nTest) };
+    }
+    const a = split(pos), b = split(neg);
+    return {
+      train: a.train.concat(b.train),
+      test: a.test.concat(b.test)
+    };
+  }
+
+  function buildXY(rows, featureCols, labelCol){
+    const X = [], y = [];
+    for(const r of rows){
+      const vec = [];
+      let ok = true;
+      for(const c of featureCols){
+        const v = Number(r[c]);
+        if(Number.isFinite(v)) vec.push(v); else { ok=false; break; }
+      }
+      const lbl = Number(r[labelCol]);
+      if(ok && (lbl===0 || lbl===1)){
+        X.push(vec); y.push(lbl);
+      }
+    }
+    return { X, y };
+  }
+
+  function accuracy(yTrue, yPred){
+    let m=0; for(let i=0;i<yTrue.length;i++){ if(yTrue[i]===yPred[i]) m++; }
+    return yTrue.length? m/yTrue.length : 0;
+  }
+
+  function probToColor(p, palette){
+    // Simple palettes
+    function lerp(a,b,t){return a+(b-a)*t}
+    function clamp(x){return Math.max(0,Math.min(1,x))}
+    const t = clamp(p);
+    let r=0,g=0,b=0;
+    switch(palette){
+      case 'red': r = Math.round(lerp(0,255,t)); g = Math.round(lerp(20,80,t)); b = Math.round(lerp(30,60,t)); break;
+      case 'blue': r = Math.round(lerp(20,60,t)); g = Math.round(lerp(40,120,t)); b = Math.round(lerp(60,255,t)); break;
+      case 'green': r = Math.round(lerp(30,60,t)); g = Math.round(lerp(40,255,t)); b = Math.round(lerp(30,60,t)); break;
+      default: // viridis‑ish
+        // piecewise (rough)
+        r = Math.round(255*clamp(-1.5*t*t + 2.2*t - 0.1));
+        g = Math.round(255*clamp(-4*t*t + 4.5*t + 0.2));
+        b = Math.round(255*clamp(2.5*t*t - 1.3*t + 1));
+    }
+    return `rgb(${r},${g},${b})`;
+  }
+
+  function downloadJSON(obj, filename){
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(obj));
+    const a = document.createElement('a');
+    a.setAttribute('href', dataStr);
+    a.setAttribute('download', filename);
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  // ====== UI handlers ======
+  $('btnPreview').addEventListener('click', async ()=>{
+    const f = $('trainFile').files[0];
+    if(!f){ alert('Please choose a training CSV file.'); return; }
+    setStatus('parsing CSV…');
+    state.labelCol = $('labelCol').value.trim() || 'presence';
+    state.featureCols = $('featureCols').value.split(',').map(s=>s.trim()).filter(Boolean);
+    try{
+      const rows = await parseCSV(f);
+      state.trainRows = rows;
+      csvToMarkers(rows);
+      const head = Object.keys(rows[0] || {});
+      $('previewBox').innerHTML = `Rows: ${rows.length}\nHead: ${head.slice(0,8).join(', ')}\nLabel: ${state.labelCol}\nFeatures: ${state.featureCols.join(', ')}`;
+      setStatus('ready');
+    }catch(err){ console.error(err); setStatus('error parsing CSV'); alert('Failed to parse CSV'); }
+  });
+
+  $('btnTrain').addEventListener('click', async ()=>{
+    if(!state.trainRows.length){ alert('Upload training CSV first, then Preview.'); return; }
+    if(!state.featureCols.length){ alert('Provide feature columns.'); return; }
+    setStatus('training…');
+    const split = holdoutSplit(state.trainRows, state.labelCol, 0.2);
+    const tr = buildXY(split.train, state.featureCols, state.labelCol);
+    const te = buildXY(split.test, state.featureCols, state.labelCol);
+
+    // ml-random-forest expects dataset as array of objects -> we'll wrap with Matrix compatibility
+    // Using RandomForestClassifier from ml-random-forest
+    const RF = ML.RandomForestClassifier;
+    const rf = new RF({
+      nEstimators: state.rfParams.nEstimators,
+      maxDepth: state.rfParams.maxDepth,
+      replacement: true,
+      seed: state.rfParams.seed,
+      useSampleBagging: true
+    });
+
+    rf.train(tr.X, tr.y);
+    const yPred = rf.predict(te.X);
+    const acc = accuracy(te.y, yPred);
+    state.forest = rf;
+
+    $('previewBox').innerHTML += `\nTrained RF ✓  (trees=${state.rfParams.nEstimators}, depth=${state.rfParams.maxDepth})\nHold‑out accuracy: ${(acc*100).toFixed(1)}% (n=${te.y.length})`;
+    setStatus('trained');
+  });
+
+  $('btnPredict').addEventListener('click', async ()=>{
+    if(!state.forest){ alert('Train the Random Forest first.'); return; }
+    const f = $('predictFile').files[0];
+    if(!f){ alert('Upload a prediction GeoJSON file.'); return; }
+
+    setStatus('reading prediction GeoJSON…');
+    const text = await f.text();
+    let gj = null;
+    try{ gj = JSON.parse(text); }catch(e){ alert('Invalid GeoJSON.'); setStatus('error'); return; }
+    state.predictGeoJSON = gj;
+
+    const palette = $('paletteSel').value;
+    const idCol = $('predIdCol').value.trim();
+
+    // Add probability + class for each feature
+    let nOk=0;
+    gj.features.forEach(feat => {
+      const props = feat.properties || (feat.properties = {});
+      // Build feature vector in the same order
+      const vec = [];
+      let ok = true;
+      for(const c of state.featureCols){
+        const v = Number(props[c]);
+        if(Number.isFinite(v)) vec.push(v); else { ok=false; break; }
+      }
+      if(!ok){ props._rf_prob = null; props._rf_class = null; return; }
+      const prob = state.forest.predictProbabilities([vec])[0][1]; // probability of class 1
+      const cls = prob >= 0.5 ? 1 : 0;
+      props._rf_prob = prob; props._rf_class = cls;
+      nOk++;
+    });
+
+    state.predictResult = gj;
+
+    // Visualize
+    layers.prediction.clearLayers();
+    const threshold = Number($('threshold').value) || 0.5;
+
+    function stylePoly(f){
+      const p = f.properties? f.properties._rf_prob : null;
+      const col = Number.isFinite(p) ? probToColor(p, palette) : '#555';
+      const dash = (Number.isFinite(p) && p>=threshold) ? null : '4 4';
+      return { color: col, weight: 1, fillOpacity: 0.55, opacity: 0.9, dashArray: dash };
+    }
+
+    function pointToLayer(ft, latlng){
+      const p = ft.properties? ft.properties._rf_prob : null;
+      const col = Number.isFinite(p) ? probToColor(p, palette) : '#888';
+      return L.circleMarker(latlng, { radius: 5, color: col, weight: 1, fillOpacity: 0.9 });
+    }
+
+    const layer = L.geoJSON(gj, { style: stylePoly, pointToLayer });
+    layer.bindTooltip(l => {
+      const pr = l.feature.properties || {};
+      const idv = idCol && pr[idCol] != null ? `<div><b>${idCol}</b>: ${pr[idCol]}</div>` : '';
+      return `
+        ${idv}
+        <div><b>prob</b>: ${(Number(pr._rf_prob)||0).toFixed(3)}</div>
+        <div><b>class</b>: ${pr._rf_class}</div>
+      `;
+    });
+    layer.addTo(layers.prediction);
+    try{ map.fitBounds(layer.getBounds(), { padding:[12,12] }); }catch(e){}
+
+    $('predictStats').textContent = `Predicted ${nOk}/${gj.features.length} features (need all required feature columns).`;
+    setStatus('predicted');
+  });
+
+  $('btnExport').addEventListener('click', ()=>{
+    if(!state.predictResult){ alert('No prediction yet.'); return; }
+    downloadJSON(state.predictResult, 'firefly_suitability.geojson');
+  });
+
+  $('btnRecolor').addEventListener('click', ()=>{
+    if(!state.predictResult){ alert('No prediction layer to style.'); return; }
+    layers.prediction.clearLayers();
+    const palette = $('paletteSel').value;
+    const threshold = Number($('threshold').value) || 0.5;
+    const layer = L.geoJSON(state.predictResult, {
+      style: f => {
+        const p = f.properties? f.properties._rf_prob : null;
+        const col = Number.isFinite(p) ? probToColor(p, palette) : '#555';
+        const dash = (Number.isFinite(p) && p>=threshold) ? null : '4 4';
+        return { color: col, weight: 1, fillOpacity: 0.55, opacity: 0.9, dashArray: dash };
+      },
+      pointToLayer: (ft,latlng)=>{
+        const p = ft.properties? ft.properties._rf_prob : null;
+        const col = Number.isFinite(p) ? probToColor(p, palette) : '#888';
+        return L.circleMarker(latlng, { radius: 5, color: col, weight: 1, fillOpacity: 0.9 });
+      }
+    }).addTo(layers.prediction);
+  });
+
+  $('btnParams').addEventListener('click', ()=>{
+    const trees = prompt('Number of trees (nEstimators)', String(state.rfParams.nEstimators));
+    const depth = prompt('Max tree depth', String(state.rfParams.maxDepth));
+    const seed = prompt('Random seed', String(state.rfParams.seed));
+    if(trees) state.rfParams.nEstimators = Math.max(1, parseInt(trees));
+    if(depth) state.rfParams.maxDepth = Math.max(1, parseInt(depth));
+    if(seed) state.rfParams.seed = parseInt(seed);
+    $('rfTrees').textContent = state.rfParams.nEstimators;
+    $('rfDepth').textContent = state.rfParams.maxDepth;
+  });
+
+  $('btnClear').addEventListener('click', ()=>{
+    layers.training.clearLayers();
+    layers.prediction.clearLayers();
+    state.trainRows = []; state.predictGeoJSON = null; state.predictResult = null; state.forest = null;
+    setStatus('idle');
+    $('previewBox').textContent = '';
+    $('predictStats').textContent = '';
+  });
+
+  // Tiny metrics box updater (hover for value)
+  map.on('mousemove', (e)=>{
+    const ll = e.latlng;
+    $('metricBox').textContent = `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
+  });
+})();
+</script>
+
+<!--
+====================
+SAMPLE DATA SCHEMA
+====================
+TRAINING CSV (example header):
+lon,lat,ndvi,canopy,dist_water,salinity,presence
+110.732,-2.11,0.42,65,120,14,1
+110.744,-2.10,0.18,30,550,11,0
+...
+
+PREDICTION GEOJSON (example feature properties must include ndvi, canopy, dist_water, salinity):
+{
+  "type":"FeatureCollection",
+  "features":[
+    {"type":"Feature","properties":{"cell_id":1,"ndvi":0.35,"canopy":54,"dist_water":160,"salinity":13},"geometry":{"type":"Polygon","coordinates":[...]}}
+  ]
+}
+-->
+
+</body>
+</html>
